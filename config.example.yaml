@@ -90,7 +90,7 @@ management:
   # base-url: "https://proxy.example.com"
 
   # GitHub repository for the management control panel. Accepts a repository URL or releases API URL.
-  panel-github-repository: "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+  panel-github-repository: "https://github.com/aviarytech/Cli-Proxy-API-Management-Center"
 
 # Client authentication for the proxy API. These are not upstream provider keys.
 access:
@@ -149,7 +149,8 @@ routing:
   # An established binding outranks credential priority: once a session is bound, that
   # credential is kept even if a higher-priority credential recovers. Credential priority
   # still decides cold bindings, requests without a session, and post-failover rebinding.
-  session-affinity: false # default: false
+  # Omitted means enabled; set false to use the plain strategy above for every request.
+  session-affinity: true # default: true
   # How long session-to-auth bindings are retained. Default: 1h
   session-affinity-ttl: "1h"
   # When true (default), subagents (child sessions with parent references) inherit and bind
@@ -300,6 +301,12 @@ client:
 # Shared upstream behavior applies to OAuth and API-key credentials.
 upstream:
   codex:
+    # Send every Codex Responses request over the upstream WebSocket transport, including
+    # HTTP/SSE client requests, for credentials that do not set websockets: false (default: true).
+    # HTTP/SSE requests of one conversation reuse a socket per credential while it stays idle
+    # for less than 5 minutes; compaction, image endpoints, token counting and upstreams that
+    # answer 426 Upgrade Required keep using HTTP.
+    force-websockets: true
     # Experimental full-duplex Codex Responses WebSocket steering (default: false).
     # Keeps one upstream account/model per socket; accepted input is never replayed.
     response-steering: false
@@ -617,7 +624,7 @@ upstream:
 #           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
 #           disable-codex-cloaking: false # optional: true disables cloaking; OAuth provider settings do not apply here
 #           alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
-#           websockets: false # optional: use the Codex upstream WebSocket transport
+#           websockets: false # optional: true/false overrides upstream.codex.force-websockets for this key
 #
 #   # Claude API keys
 #

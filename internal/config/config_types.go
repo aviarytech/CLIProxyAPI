@@ -217,6 +217,19 @@ type CodexConfig struct {
 	// ResponseSteering enables full-duplex Codex WebSockets, bound to one
 	// upstream model/account/socket for their entire lifetime. Default is false.
 	ResponseSteering bool `yaml:"response-steering" json:"response-steering"`
+	// ForceWebsockets sends every Codex Responses request, including HTTP/SSE client requests,
+	// over the upstream WebSocket transport for credentials that do not set websockets: false.
+	// Requests the WebSocket transport cannot serve (compaction, image endpoints, token counting)
+	// and upgrade-required rejections keep using HTTP. Default: true.
+	ForceWebsockets *bool `yaml:"force-websockets,omitempty" json:"force-websockets,omitempty"`
+}
+
+// ForceWebsocketsEnabled reports the effective force-websockets setting; omitted means enabled.
+func (c *CodexConfig) ForceWebsocketsEnabled() bool {
+	if c == nil || c.ForceWebsockets == nil {
+		return true
+	}
+	return *c.ForceWebsockets
 }
 
 // DefaultCodexStreamBootstrapTimeout is the default maximum duration to buffer bootstrap events.
@@ -359,7 +372,8 @@ type RoutingConfig struct {
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
 	// execution or derived session identity, and the existing message-content hash fallback.
 	// Automatic failover is always enabled when bound auth becomes unavailable.
-	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+	// Default: true. Set to false explicitly to disable.
+	SessionAffinity *bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
@@ -371,6 +385,14 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+}
+
+// SessionAffinityEnabled reports the effective session-affinity setting; omitted means enabled.
+func (r *RoutingConfig) SessionAffinityEnabled() bool {
+	if r == nil || r.SessionAffinity == nil {
+		return true
+	}
+	return *r.SessionAffinity
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.
@@ -646,8 +668,10 @@ type CodexKey struct {
 	// If empty, the default Codex API URL will be used.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 
-	// Websockets enables the Responses API websocket transport for this credential.
-	Websockets bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
+	// Websockets selects the Responses API websocket transport for this credential.
+	// Omitted inherits the provider default (Codex: upstream.codex.force-websockets);
+	// an explicit false keeps this credential on HTTP.
+	Websockets *bool `yaml:"websockets,omitempty" json:"websockets,omitempty"`
 
 	// AlphaSearch allows this Codex API key to serve the Alpha Search endpoint.
 	AlphaSearch bool `yaml:"alpha-search,omitempty" json:"alpha-search,omitempty"`

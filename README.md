@@ -2,6 +2,14 @@
 
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
+> **aviarytech fork.** Install the proxy, the [quota dashboard](https://github.com/aviarytech/Cli-Proxy-API-Management-Center), and Claude Code / Codex / T3 Code clients that route through it:
+>
+> ```bash
+> curl -fsSL https://raw.githubusercontent.com/aviarytech/CLIProxyAPI/main/install.sh | bash
+> ```
+>
+> Requires `git`, `go`, `curl`, and `python3`. Re-run it to update. See the header of [`install.sh`](install.sh) for options.
+
 If you want to use CLIProxyAPI on your desktop, we recommend our [EasyCLIProxyAPI](https://github.com/router-for-me/EasyCLIProxyAPI) desktop client. It provides a graphical configuration UI, automatic updates, system tray integration, and one-click start/stop for the CLIProxyAPI service.
 
 CLIProxyAPI is a proxy server that provides OpenAI/Gemini/Claude/Codex/Grok compatible API interfaces for CLI.

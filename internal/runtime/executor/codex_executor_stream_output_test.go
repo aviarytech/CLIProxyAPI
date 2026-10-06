@@ -311,8 +311,9 @@ func TestCodexAutoExecutorHTTPFallbackForwardsSequentialCutoffReasoningSummaryDe
 
 	executor := NewCodexAutoExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{Attributes: map[string]string{
-		"base_url": server.URL,
-		"api_key":  "test",
+		"base_url":   server.URL,
+		"api_key":    "test",
+		"websockets": "false",
 	}}
 	result, err := executor.ExecuteStream(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, cliproxyexecutor.Request{
 		Model:   "gpt-5.6-sol",

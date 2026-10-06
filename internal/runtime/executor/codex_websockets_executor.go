@@ -6,8 +6,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"strconv"
-	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -31,21 +29,41 @@ func NewCodexWebsocketsExecutor(cfg *config.Config) *CodexWebsocketsExecutor {
 	}
 }
 
-// CodexAutoExecutor routes Codex requests to the websocket transport only when:
-//  1. The downstream transport is websocket, and
-//  2. The selected auth enables websockets.
+// CodexAutoExecutor routes Codex Responses requests to the websocket transport when the
+// selected auth uses websockets (see codexWebsocketsEnabled) and either:
+//  1. The downstream transport is websocket, or
+//  2. upstream.codex.force-websockets is enabled (the default), which also covers
+//     HTTP/SSE downstream requests.
 //
-// For non-websocket downstream requests, it always uses the legacy HTTP implementation.
+// Everything else, including image endpoints, token counting and raw HTTP requests,
+// uses the HTTP implementation.
 type CodexAutoExecutor struct {
+	cfg      *config.Config
 	httpExec *CodexExecutor
 	wsExec   *CodexWebsocketsExecutor
 }
 
 func NewCodexAutoExecutor(cfg *config.Config) *CodexAutoExecutor {
 	return &CodexAutoExecutor{
+		cfg:      cfg,
 		httpExec: NewCodexExecutor(cfg),
 		wsExec:   NewCodexWebsocketsExecutor(cfg),
 	}
+}
+
+// useWebsockets reports whether a Responses request should use the websocket executor.
+func (e *CodexAutoExecutor) useWebsockets(ctx context.Context, auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) bool {
+	if !codexWebsocketsEnabled(e.cfg, auth) {
+		return false
+	}
+	if cliproxyexecutor.DownstreamWebsocket(ctx) {
+		return true
+	}
+	if !codexForceWebsockets(e.cfg) {
+		return false
+	}
+	// The images endpoints have no websocket equivalent.
+	return !isCodexOpenAIImageRequest(opts)
 }
 
 func (e *CodexAutoExecutor) Identifier() string { return "codex" }
@@ -68,7 +86,7 @@ func (e *CodexAutoExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return cliproxyexecutor.Response{}, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if e.useWebsockets(ctx, auth, opts) {
 		return e.wsExec.Execute(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -81,7 +99,7 @@ func (e *CodexAutoExecutor) ExecuteStream(ctx context.Context, auth *cliproxyaut
 	if e == nil || e.httpExec == nil || e.wsExec == nil {
 		return nil, fmt.Errorf("codex auto executor: executor is nil")
 	}
-	if cliproxyexecutor.DownstreamWebsocket(ctx) && codexWebsocketsEnabled(auth) {
+	if e.useWebsockets(ctx, auth, opts) {
 		return e.wsExec.ExecuteStream(ctx, auth, req, opts)
 	}
 	if cliproxyexecutor.RequiredUpstreamWebsocket(ctx) {
@@ -118,36 +136,25 @@ func (e *CodexAutoExecutor) UpstreamDisconnectChan(sessionID string) <-chan erro
 	return e.wsExec.UpstreamDisconnectChan(sessionID)
 }
 
-func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {
+// codexForceWebsockets reports upstream.codex.force-websockets, which defaults to enabled.
+func codexForceWebsockets(cfg *config.Config) bool {
+	if cfg == nil {
+		return true
+	}
+	return cfg.Codex.ForceWebsocketsEnabled()
+}
+
+// codexWebsocketsEnabled reports whether auth uses the upstream websocket transport.
+// An explicit websockets attribute or metadata value wins; otherwise the credential
+// follows upstream.codex.force-websockets.
+func codexWebsocketsEnabled(cfg *config.Config, auth *cliproxyauth.Auth) bool {
 	if auth == nil {
 		return false
 	}
-	if len(auth.Attributes) > 0 {
-		if raw := strings.TrimSpace(auth.Attributes["websockets"]); raw != "" {
-			parsed, errParse := strconv.ParseBool(raw)
-			if errParse == nil {
-				return parsed
-			}
-		}
+	if enabled, ok := cliproxyauth.ExplicitWebsocketsSetting(auth); ok {
+		return enabled
 	}
-	if len(auth.Metadata) == 0 {
-		return false
-	}
-	raw, ok := auth.Metadata["websockets"]
-	if !ok || raw == nil {
-		return false
-	}
-	switch v := raw.(type) {
-	case bool:
-		return v
-	case string:
-		parsed, errParse := strconv.ParseBool(strings.TrimSpace(v))
-		if errParse == nil {
-			return parsed
-		}
-	default:
-	}
-	return false
+	return codexForceWebsockets(cfg)
 }
 
 // SupportsApplyPatch requires both selectable transports to support the tool.

@@ -363,7 +363,8 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("codex")}
 
-	if _, err := exec.Execute(context.Background(), auth, req, opts); err != nil {
+	// previous_response_id only refers to a socket the client owns, i.e. a downstream websocket.
+	if _, err := exec.Execute(cliproxyexecutor.WithDownstreamWebsocket(context.Background()), auth, req, opts); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 

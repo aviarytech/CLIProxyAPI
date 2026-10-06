@@ -314,7 +314,7 @@ func TestConfigSynthesizer_CodexKeys(t *testing.T) {
 					Prefix:               "dev",
 					BaseURL:              "https://api.openai.com",
 					ProxyURL:             "http://proxy.local",
-					Websockets:           true,
+					Websockets:           boolPointer(true),
 					AlphaSearch:          true,
 					DisableCooling:       boolPointer(true),
 					DisableCodexCloaking: boolPointer(true),
@@ -365,7 +365,7 @@ func TestConfigSynthesizer_XAIKeys(t *testing.T) {
 				Prefix:         "grok",
 				BaseURL:        "https://api.x.ai/v1",
 				ProxyURL:       "http://proxy.local",
-				Websockets:     true,
+				Websockets:     boolPointer(true),
 				AlphaSearch:    true,
 				DisableCooling: boolPointer(true),
 				Headers:        map[string]string{"X-Custom": "value"},
@@ -1320,5 +1320,33 @@ func TestConfigSynthesizer_RequestScopedErrors(t *testing.T) {
 		if !ok || len(extracted) != 1 || extracted[0].Action != "stop" {
 			t.Fatalf("auth %s unexpected request_scoped_errors: %#v", auth.ID, val)
 		}
+	}
+}
+
+func TestConfigSynthesizer_CodexKeyWebsocketsSetting(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		websockets *bool
+		want       string
+		wantSet    bool
+	}{
+		{name: "omitted inherits provider default", websockets: nil},
+		{name: "explicit true", websockets: boolPointer(true), want: "true", wantSet: true},
+		{name: "explicit false opts out", websockets: boolPointer(false), want: "false", wantSet: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			auths, err := NewConfigSynthesizer().Synthesize(&SynthesisContext{
+				Config:      &config.Config{CodexKey: []config.CodexKey{{APIKey: "codex-key", Websockets: tc.websockets}}},
+				Now:         time.Now(),
+				IDGenerator: NewStableIDGenerator(),
+			})
+			if err != nil || len(auths) != 1 {
+				t.Fatalf("Synthesize() = %d auths, error %v", len(auths), err)
+			}
+			got, ok := auths[0].Attributes["websockets"]
+			if ok != tc.wantSet || got != tc.want {
+				t.Fatalf("websockets attribute = %q (set %t), want %q (set %t)", got, ok, tc.want, tc.wantSet)
+			}
+		})
 	}
 }

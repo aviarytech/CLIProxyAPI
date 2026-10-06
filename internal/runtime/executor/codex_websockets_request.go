@@ -16,6 +16,7 @@ import (
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v8/sdk/translator"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
 func applyCodexPromptCacheHeaders(from sdktranslator.Format, req cliproxyexecutor.Request, rawJSON []byte) ([]byte, http.Header) {
@@ -49,6 +50,20 @@ func applyCodexPromptCacheHeadersWithContext(ctx context.Context, from sdktransl
 	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
 		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
 			cache.ID = promptCacheKey.String()
+		}
+	} else if sourceFormatEqual(from, sdktranslator.FormatOpenAI) {
+		// Mirrors the HTTP executor so Chat Completions clients keep their cache key when
+		// their requests are sent over the websocket transport.
+		if promptCacheKey := gjson.GetBytes(req.Payload, "prompt_cache_key"); promptCacheKey.Exists() {
+			cache.ID = strings.TrimSpace(promptCacheKey.String())
+		}
+		if cache.ID == "" {
+			cache.ID = helps.ProviderSessionUUID("codex", req.Metadata)
+		}
+		if cache.ID == "" {
+			if apiKey := strings.TrimSpace(helps.APIKeyFromContext(ctx)); apiKey != "" {
+				cache.ID = uuid.NewSHA1(uuid.NameSpaceOID, []byte("cli-proxy-api:codex:prompt-cache:"+apiKey)).String()
+			}
 		}
 	}
 	if cache.ID == "" {
@@ -341,4 +356,32 @@ func ensureHeaderWithConfigPrecedence(target http.Header, source http.Header, ke
 	if val := strings.TrimSpace(fallbackValue); val != "" {
 		target.Set(key, val)
 	}
+}
+
+// codexWebsocketClientOwnsSession reports whether the request belongs to a client-owned
+// websocket session, where previous_response_id and generate refer to that session's socket.
+// HTTP/SSE client requests never do, even when they are sent over the upstream websocket.
+func codexWebsocketClientOwnsSession(ctx context.Context, opts cliproxyexecutor.Options) bool {
+	return cliproxyexecutor.DownstreamWebsocket(ctx) || executionSessionIDFromOptions(opts) != ""
+}
+
+// normalizeCodexWebsocketRequestBody applies the transport-specific request cleanup. Requests
+// of a client-owned websocket session keep their websocket-only fields. HTTP/SSE client
+// requests sent over the upstream websocket get the same cleanup as the HTTP executor, so
+// switching the upstream transport does not change what they mean: each one carries its full
+// input and is never chained to an earlier response through previous_response_id.
+func normalizeCodexWebsocketRequestBody(body []byte, headers http.Header, clientOwnsSession bool, stream bool) []byte {
+	if clientOwnsSession {
+		return normalizeCodexWebsocketParallelToolCalls(body, headers)
+	}
+	body, _ = sjson.DeleteBytes(body, "previous_response_id")
+	body, _ = sjson.DeleteBytes(body, "generate")
+	body, _ = sjson.DeleteBytes(body, "prompt_cache_retention")
+	body, _ = sjson.DeleteBytes(body, "safety_identifier")
+	reasoningSummaryDelivery := gjson.GetBytes(body, "stream_options.reasoning_summary_delivery")
+	body, _ = sjson.DeleteBytes(body, "stream_options")
+	if stream && reasoningSummaryDelivery.Exists() {
+		body, _ = sjson.SetBytes(body, "stream_options.reasoning_summary_delivery", reasoningSummaryDelivery.Value())
+	}
+	return normalizeCodexParallelToolCalls(body, headers)
 }

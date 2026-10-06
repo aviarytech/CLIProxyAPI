@@ -266,13 +266,15 @@ func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
 	newRetry := 0
 	oldDisableCooling := false
 	newDisableCooling := true
+	oldWebsockets := false
+	newWebsockets := true
 	oldCfg := &config.Config{XAIKey: []config.XAIKey{{
 		APIKey:         "old-key",
 		Priority:       1,
 		Prefix:         "old",
 		BaseURL:        "https://old.example.com/v1",
 		ProxyURL:       "http://old-proxy",
-		Websockets:     false,
+		Websockets:     &oldWebsockets,
 		DisableCooling: &oldDisableCooling,
 		RequestRetry:   &oldRetry,
 		Headers:        map[string]string{"X-Test": "old"},
@@ -285,7 +287,7 @@ func TestBuildConfigChangeDetails_XAIKeys(t *testing.T) {
 		Prefix:         "new",
 		BaseURL:        "https://new.example.com/v1",
 		ProxyURL:       "http://new-proxy",
-		Websockets:     true,
+		Websockets:     &newWebsockets,
 		DisableCooling: &newDisableCooling,
 		RequestRetry:   &newRetry,
 		Headers:        map[string]string{"X-Test": "new"},
@@ -738,5 +740,26 @@ func TestTrimStrings(t *testing.T) {
 	out := trimStrings([]string{" a ", "b", "  c"})
 	if len(out) != 3 || out[0] != "a" || out[1] != "b" || out[2] != "c" {
 		t.Fatalf("unexpected trimmed strings: %v", out)
+	}
+}
+
+func TestBuildConfigChangeDetailsReportsEffectiveForkDefaults(t *testing.T) {
+	disabled := false
+	enabled := true
+	changes := BuildConfigChangeDetails(&config.Config{}, &config.Config{
+		Codex:   config.CodexConfig{ForceWebsockets: &disabled},
+		Routing: config.RoutingConfig{SessionAffinity: &disabled},
+	})
+	expectContains(t, changes, "codex.force-websockets: true -> false")
+	expectContains(t, changes, "routing.session-affinity: true -> false")
+
+	unchanged := BuildConfigChangeDetails(&config.Config{}, &config.Config{
+		Codex:   config.CodexConfig{ForceWebsockets: &enabled},
+		Routing: config.RoutingConfig{SessionAffinity: &enabled},
+	})
+	for _, change := range unchanged {
+		if strings.HasPrefix(change, "codex.force-websockets") || strings.HasPrefix(change, "routing.session-affinity") {
+			t.Fatalf("explicit true reported as a change from the default: %v", unchanged)
+		}
 	}
 }
