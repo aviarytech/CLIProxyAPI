@@ -3,8 +3,11 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -50,6 +53,9 @@ func (c *websocketConnectionCloser) Close() error {
 
 type codexWebsocketSession struct {
 	sessionID string
+	// pooled marks a session that carries HTTP/SSE client requests of one conversation on
+	// one credential. It is acquired without blocking and evicted once its socket is gone.
+	pooled bool
 
 	reqMu sync.Mutex
 
@@ -60,9 +66,11 @@ type codexWebsocketSession struct {
 	authID                    string
 	proxyURL                  string
 	multiAgentV2OptimizedConn *websocket.Conn
-	lifecycleBindMu           sync.Mutex
-	lifecycle                 cliproxyexecutor.ExecutionLifecycle
-	lifecycleModel            string
+	// handshakeFingerprint identifies the handshake a pooled session's socket was opened with.
+	handshakeFingerprint string
+	lifecycleBindMu      sync.Mutex
+	lifecycle            cliproxyexecutor.ExecutionLifecycle
+	lifecycleModel       string
 
 	writeMu sync.Mutex
 
@@ -818,6 +826,7 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConnWithNotify(sess *codexWe
 	if lifecycle != nil {
 		lifecycle.End(reason)
 	}
+	e.evictIdlePooledSession(sess)
 }
 
 func (e *CodexWebsocketsExecutor) CloseExecutionSession(sessionID string) {
@@ -916,6 +925,9 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 func sessionObjectKind(sess *codexWebsocketSession) string {
 	if sess == nil {
 		return "none"
+	}
+	if sess.pooled {
+		return "pooled"
 	}
 	if strings.TrimSpace(sess.sessionID) != "" {
 		return "persistent"
@@ -1030,4 +1042,145 @@ func CloseCodexWebsocketSessionsForAuthID(authID string, reason string) {
 	for i := range toClose {
 		closeCodexWebsocketSession(toClose[i], reason)
 	}
+}
+
+// codexHTTPPooledSessionPrefix namespaces pooled sessions in the session store so they can
+// never collide with downstream websocket execution session IDs.
+const codexHTTPPooledSessionPrefix = "codex-http-pool:"
+
+// codexHTTPPooledSessionKey returns the store key under which HTTP/SSE client requests of one
+// conversation share an upstream websocket on one credential, or "" when the request must use a
+// one-shot socket. The conversation is the canonical session identity the conductor attaches to
+// every execution, which is the identity session affinity binds to a credential. The credential
+// is part of the key, so a socket opened for one credential is never offered to another one,
+// including after an affinity failover rebinds the conversation.
+func codexHTTPPooledSessionKey(ctx context.Context, opts cliproxyexecutor.Options, authID string) string {
+	if cliproxyexecutor.DownstreamWebsocket(ctx) || cliproxyexecutor.RequiredUpstreamWebsocket(ctx) || opts.ExecutionLifecycle != nil {
+		return ""
+	}
+	authID = strings.TrimSpace(authID)
+	if authID == "" || len(opts.Metadata) == 0 {
+		return ""
+	}
+	sessionID, _ := opts.Metadata[cliproxyexecutor.CanonicalSessionIDMetadataKey].(string)
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(authID + "\x00" + sessionID))
+	return codexHTTPPooledSessionPrefix + hex.EncodeToString(sum[:16])
+}
+
+// codexWebsocketHandshakeFingerprint hashes everything that shapes the websocket handshake.
+// Per-request headers such as turn metadata live in the handshake, so a pooled socket is only
+// reused while the next request would have opened an identical one.
+func codexWebsocketHandshakeFingerprint(wsURL string, proxyURL string, headers http.Header) string {
+	h := sha256.New()
+	write := func(value string) {
+		_, _ = h.Write([]byte(value))
+		_, _ = h.Write([]byte{0})
+	}
+	write(strings.TrimSpace(wsURL))
+	write(strings.TrimSpace(proxyURL))
+	keys := make([]string, 0, len(headers))
+	for key := range headers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		write(key)
+		for _, value := range headers[key] {
+			write(value)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func (e *CodexWebsocketsExecutor) sessionStore() *codexWebsocketSessionStore {
+	if e != nil && e.store != nil {
+		return e.store
+	}
+	return globalCodexWebsocketSessionStore
+}
+
+// acquirePooledSession returns the pooled session for key with its request lock held, or nil
+// when key is empty or another request is using the session. A busy session is not waited for:
+// the caller falls back to a one-shot socket, so parallel requests of one conversation never
+// queue behind each other and never share a socket.
+func (e *CodexWebsocketsExecutor) acquirePooledSession(key string) *codexWebsocketSession {
+	if e == nil || key == "" {
+		return nil
+	}
+	store := e.sessionStore()
+	// A session evicted between lookup and lock is retried once with a fresh entry.
+	for attempt := 0; attempt < 2; attempt++ {
+		store.mu.Lock()
+		if store.sessions == nil {
+			store.sessions = make(map[string]*codexWebsocketSession)
+		}
+		sess := store.sessions[key]
+		if sess == nil {
+			sess = &codexWebsocketSession{
+				sessionID:            key,
+				pooled:               true,
+				upstreamDisconnectCh: make(chan error, 1),
+			}
+			store.sessions[key] = sess
+		}
+		store.mu.Unlock()
+
+		if !sess.reqMu.TryLock() {
+			return nil
+		}
+		store.mu.Lock()
+		current := store.sessions[key] == sess
+		store.mu.Unlock()
+		if current {
+			return sess
+		}
+		sess.reqMu.Unlock()
+	}
+	return nil
+}
+
+// preparePooledSessionHandshake drops the pooled socket when this request's handshake differs
+// from the one it was opened with. The caller must hold sess.reqMu.
+func (e *CodexWebsocketsExecutor) preparePooledSessionHandshake(sess *codexWebsocketSession, fingerprint string) {
+	if sess == nil || !sess.pooled {
+		return
+	}
+	sess.connMu.Lock()
+	conn := sess.conn
+	changed := sess.handshakeFingerprint != fingerprint
+	sess.handshakeFingerprint = fingerprint
+	sess.connMu.Unlock()
+	if changed && conn != nil {
+		e.invalidateUpstreamConnWithoutDisconnectNotify(sess, conn, "handshake_changed", nil)
+	}
+}
+
+// evictIdlePooledSession removes a pooled session from the store once it has no socket and no
+// request in flight. Sockets are closed by the reader's idle deadline or by an error, so a
+// pooled session lives at most one websocket idle timeout past its last request.
+func (e *CodexWebsocketsExecutor) evictIdlePooledSession(sess *codexWebsocketSession) {
+	if sess == nil || !sess.pooled {
+		return
+	}
+	if !sess.reqMu.TryLock() {
+		// The request holding the lock evicts on release.
+		return
+	}
+	defer sess.reqMu.Unlock()
+	sess.connMu.Lock()
+	idle := sess.conn == nil
+	sess.connMu.Unlock()
+	if !idle {
+		return
+	}
+	store := e.sessionStore()
+	store.mu.Lock()
+	if store.sessions[sess.sessionID] == sess {
+		delete(store.sessions, sess.sessionID)
+	}
+	store.mu.Unlock()
 }

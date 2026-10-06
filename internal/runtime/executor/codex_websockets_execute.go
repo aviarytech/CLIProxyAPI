@@ -22,6 +22,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	ctx = helps.EnsureSessionContext(ctx, opts, req.Payload)
 	if opts.Alt == "responses/compact" {
 		return e.CodexExecutor.executeCompact(ctx, auth, req, opts)
 	}
@@ -62,7 +63,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		body = ensureImageGenerationTool(body, baseModel, auth, opts.Headers)
 	}
 	body = sanitizeOpenAIResponsesReasoningEncryptedContentWithCompat(ctx, "codex websockets executor", body, isCompat)
-	body = normalizeCodexWebsocketParallelToolCalls(body, opts.Headers)
+	body = normalizeCodexWebsocketRequestBody(body, opts.Headers, codexWebsocketClientOwnsSession(ctx, opts), false)
 	body = helps.NormalizeCodexToolSchemas(body)
 	multiAgentV2Conflict := helps.HasCodexMultiAgentV2NamespaceConflict(body)
 	body, optimizeMultiAgentV2 := helps.OptimizeCodexMultiAgentV2RequestForAuth(ctx, opts.Headers, body, e.cfg, auth, isCompat)
@@ -97,11 +98,15 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 	executionSessionID := executionSessionIDFromOptions(opts)
 	var sess *codexWebsocketSession
 	isEphemeralSession := false
+	pooledSession := false
 	sessionLocked := false
 	unlockSession := func() {
 		if sess != nil && sessionLocked {
 			sess.reqMu.Unlock()
 			sessionLocked = false
+			if pooledSession {
+				e.evictIdlePooledSession(sess)
+			}
 		}
 	}
 	if executionSessionID != "" {
@@ -109,6 +114,11 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 		sess.reqMu.Lock()
 		sessionLocked = true
 		defer unlockSession()
+	} else if sess = e.acquirePooledSession(codexHTTPPooledSessionKey(ctx, opts, authID)); sess != nil {
+		pooledSession = true
+		sessionLocked = true
+		defer unlockSession()
+		e.preparePooledSessionHandshake(sess, codexWebsocketHandshakeFingerprint(wsURL, executionProxyURL(ctx, e.cfg, auth), wsHeaders))
 	} else {
 		isEphemeralSession = true
 		sess = newEphemeralCodexWebsocketSession()
@@ -189,7 +199,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			sess.clearActive(conn, readCh)
 		}()
 	}
-	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+	restoreMultiAgentV2 := !multiAgentV2Conflict && (optimizeMultiAgentV2 || (!pooledSession && sess.isMultiAgentV2Optimized(conn)))
 
 	cliproxyexecutor.MarkUpstreamAttempt(ctx)
 	if errSend := writeCodexWebsocketMessage(sess, conn, wsReqBody); errSend != nil {
@@ -224,7 +234,7 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 					return resp, errBind
 				}
 				readCh = sess.activate(conn)
-				restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || sess.isMultiAgentV2Optimized(conn))
+				restoreMultiAgentV2 = !multiAgentV2Conflict && (optimizeMultiAgentV2 || (!pooledSession && sess.isMultiAgentV2Optimized(conn)))
 				wsReqBodyRetry := frameCodexWebsocketRequestBody(body)
 				helps.RecordAPIWebsocketRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 					URL:       wsURL,
@@ -348,17 +358,24 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			if eventType != "response.incomplete" {
 				cacheCodexReasoningReplayFromCompleted(replayScope, payload)
 			}
+			var param any
+			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, payload, &param)
+			if helps.ApplyPatchTranslationError(param) != nil || len(out) == 0 {
+				return cliproxyexecutor.Response{}, statusErr{code: http.StatusBadGateway, msg: helps.ApplyPatchUpstreamErrorMessage}
+			}
 			if detail, ok := helps.ParseCodexUsage(payload); ok {
 				reporter.Publish(ctx, detail)
 			} else {
 				reporter.EnsurePublished(ctx)
 			}
-			var param any
-			out := sdktranslator.TranslateNonStream(ctx, to, responseFormat, req.Model, originalPayload, body, payload, &param)
+			publishCodexImageToolUsage(ctx, reporter, body, payload)
 			if responseFormat == sdktranslator.FormatOpenAIResponse {
 				out = helps.EnsureResponsesUsageDetails(out)
 			}
 			resp = cliproxyexecutor.Response{Payload: out}
+			if respHS != nil {
+				resp.Headers = respHS.Header.Clone()
+			}
 			return resp, nil
 		}
 	}

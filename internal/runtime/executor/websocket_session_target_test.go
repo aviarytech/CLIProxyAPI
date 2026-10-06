@@ -925,8 +925,8 @@ func (d *codex426RetryDispatcher) RPopAuth(_ context.Context, model string, _ st
 		"api_key":  "home-key",
 		"base_url": d.baseURLs[call-1],
 	}
-	if call <= len(d.websockets) && d.websockets[call-1] {
-		attributes["websockets"] = "true"
+	if call <= len(d.websockets) {
+		attributes["websockets"] = strconv.FormatBool(d.websockets[call-1])
 	}
 	return json.Marshal(map[string]any{
 		"model":      model,

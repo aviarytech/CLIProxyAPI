@@ -161,6 +161,10 @@ func (m *Manager) setConfigSnapshotLocked(cfg *internalconfig.Config) bool {
 		m.homeSessionAliases.clear()
 	}
 	m.runtimeConfig.Store(cfg)
+	if SetCodexForceWebsockets(cfg.Codex.ForceWebsocketsEnabled()) {
+		// Scheduler entries cache each credential's websocket eligibility.
+		m.syncSchedulerFromSnapshot(m.snapshotAuths())
+	}
 	clearedCooldowns := m.clearDisabledCooldownStates(cfg)
 	if clearedCooldowns && oldCooldownStore != nil {
 		m.mu.Lock()
